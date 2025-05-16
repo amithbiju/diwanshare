@@ -60,21 +60,21 @@ function FileSharing() {
   // Connect to socket when component mounts
   useEffect(() => {
     // For local development
-    const newSocket = io("http://localhost:5000");
+    //const newSocket = io("http://localhost:5000");
 
     // For production - default to same origin if deployed together...https://diwanshareserver.onrender.com
-    // const newSocket = io(
-    //   window.location.origin.includes("localhost")
-    //     ? "https://diwanshareserver.onrender.com"
-    //     : window.location.origin,
-    //   {
-    //     reconnectionAttempts: 5,
-    //     reconnectionDelay: 1000,
-    //     reconnectionDelayMax: 5000,
-    //     timeout: 20000,
-    //     transports: ["websocket", "polling"], // Try WebSocket first, fall back to polling
-    //   }
-    // );
+    const newSocket = io(
+      window.location.origin.includes("localhost")
+        ? "https://diwanshareserver.onrender.com"
+        : window.location.origin,
+      {
+        reconnectionAttempts: 5,
+        reconnectionDelay: 1000,
+        reconnectionDelayMax: 5000,
+        timeout: 20000,
+        transports: ["websocket", "polling"], // Try WebSocket first, fall back to polling
+      }
+    );
 
     newSocket.on("connect", () => {
       console.log("Socket connected:", newSocket.id);
