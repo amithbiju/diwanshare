@@ -65,7 +65,7 @@ const PeerList = ({
             </div>
           ))
         ) : (
-          <div className="text-center py-6 text-gray-500">
+          <div key={"123"} className="text-center py-6 text-gray-500">
             <p>No peers available at the moment</p>
           </div>
         )}

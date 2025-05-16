@@ -1,18 +1,25 @@
 import React, { useState, useEffect, useRef } from "react";
 import { io } from "socket.io-client";
-
 import { motion } from "framer-motion";
 import LandingPage from "./utils/LandingPage";
 import PeerList from "./utils/PeerList";
 import FileUpload from "./utils/FileUpload";
 import FileReceive from "./utils/FileReceive";
-// Configuration for WebRTC
+
+// Enhanced configuration for WebRTC with better STUN/TURN server options
 const peerConfiguration = {
   iceServers: [
     { urls: "stun:stun.l.google.com:19302" },
     { urls: "stun:stun1.l.google.com:19302" },
+    { urls: "stun:stun2.l.google.com:19302" },
+    { urls: "stun:stun3.l.google.com:19302" },
+    { urls: "stun:stun4.l.google.com:19302" },
+    // You may need to add TURN servers for production environments
+    // Example: { urls: 'turn:turn.example.com', username: 'username', credential: 'credential' }
   ],
+  iceCandidatePoolSize: 10,
 };
+
 const CircleCard = ({ children, className }) => (
   <motion.div
     initial={{ opacity: 0, scale: 0.8 }}
@@ -35,6 +42,8 @@ function FileSharing() {
   const [transferStatus, setTransferStatus] = useState("");
   const [receivedFiles, setReceivedFiles] = useState([]);
   const [broadcasting, setBroadcasting] = useState(false);
+  const [connectionState, setConnectionState] = useState("disconnected");
+  const [networkInfo, setNetworkInfo] = useState(null);
 
   // References
   const peerConnectionRef = useRef(null);
@@ -45,15 +54,74 @@ function FileSharing() {
   const receivedBuffersRef = useRef([]);
   const receivedSizeRef = useRef(0);
   const fileInfoRef = useRef(null);
+  const reconnectionAttemptsRef = useRef(0);
+  const maxReconnectionAttempts = 5;
 
   // Connect to socket when component mounts
   useEffect(() => {
-    const newSocket = io("https://diwanshareserver.onrender.com");
+    // For local development
+    const newSocket = io("http://localhost:5000");
+
+    // For production - default to same origin if deployed together...https://diwanshareserver.onrender.com
+    // const newSocket = io(
+    //   window.location.origin.includes("localhost")
+    //     ? "https://diwanshareserver.onrender.com"
+    //     : window.location.origin,
+    //   {
+    //     reconnectionAttempts: 5,
+    //     reconnectionDelay: 1000,
+    //     reconnectionDelayMax: 5000,
+    //     timeout: 20000,
+    //     transports: ["websocket", "polling"], // Try WebSocket first, fall back to polling
+    //   }
+    // );
+
+    newSocket.on("connect", () => {
+      console.log("Socket connected:", newSocket.id);
+      setConnectionState("connected");
+      reconnectionAttemptsRef.current = 0;
+    });
+
+    newSocket.on("connect_error", (err) => {
+      console.error("Socket connection error:", err);
+      setConnectionState("error");
+      setTransferStatus(`Connection error: ${err.message}. Retrying...`);
+    });
+
+    newSocket.on("disconnect", (reason) => {
+      console.log("Socket disconnected:", reason);
+      setConnectionState("disconnected");
+      setTransferStatus(`Disconnected: ${reason}. Attempting to reconnect...`);
+    });
+
     setSocket(newSocket);
+
+    // Get network information
+    try {
+      const connection =
+        navigator.connection ||
+        navigator.mozConnection ||
+        navigator.webkitConnection;
+
+      if (connection) {
+        const info = {
+          type: connection.type,
+          effectiveType: connection.effectiveType,
+          downlink: connection.downlink,
+          rtt: connection.rtt,
+        };
+        setNetworkInfo(info);
+        console.log("Network information:", info);
+      }
+    } catch (err) {
+      console.log("Could not get network information");
+    }
 
     // Clean up socket connection when component unmounts
     return () => {
-      if (newSocket) newSocket.disconnect();
+      if (newSocket) {
+        newSocket.disconnect();
+      }
     };
   }, []);
 
@@ -81,6 +149,28 @@ function FileSharing() {
       await handleReceiveICECandidate(data);
     });
 
+    socket.on("user-disconnected", (userId) => {
+      console.log("User disconnected:", userId);
+      if (selectedUser && selectedUser.socketId === userId) {
+        setTransferStatus("Selected user disconnected");
+        if (dataChannelRef.current) {
+          dataChannelRef.current.close();
+        }
+        if (peerConnectionRef.current) {
+          peerConnectionRef.current.close();
+        }
+      }
+    });
+
+    socket.on("peer-connection-status", (data) => {
+      console.log("Peer connection status:", data);
+      if (data.status === "failed") {
+        setTransferStatus(
+          `Connection with ${data.username || data.from} failed. Try again.`
+        );
+      }
+    });
+
     // Heartbeat to keep the connection alive
     const interval = setInterval(() => {
       if (socket.connected) {
@@ -93,9 +183,11 @@ function FileSharing() {
       socket.off("offer");
       socket.off("answer");
       socket.off("ice-candidate");
+      socket.off("user-disconnected");
+      socket.off("peer-connection-status");
       clearInterval(interval);
     };
-  }, [socket]);
+  }, [socket, selectedUser]);
 
   // Handle user registration
   const registerUser = () => {
@@ -105,22 +197,73 @@ function FileSharing() {
     }
   };
 
-  // Initialize peer connection and data channel
+  // Initialize peer connection and data channel with enhanced error handling
   const initializePeerConnection = () => {
+    // Close existing connection if any
     if (peerConnectionRef.current) {
-      peerConnectionRef.current.close();
+      try {
+        peerConnectionRef.current.close();
+      } catch (err) {
+        console.warn("Error closing previous peer connection:", err);
+      }
     }
 
+    console.log("Initializing new peer connection");
     const peerConnection = new RTCPeerConnection(peerConfiguration);
     peerConnectionRef.current = peerConnection;
 
     // Handle ICE candidates
     peerConnection.onicecandidate = (event) => {
-      if (event.candidate && selectedUser) {
+      if (event.candidate && selectedUser && socket) {
+        console.log("Sending ICE candidate to:", selectedUser.socketId);
         socket.emit("ice-candidate", {
           target: selectedUser.socketId,
           candidate: event.candidate,
         });
+      }
+    };
+
+    // Log connection state changes
+    peerConnection.onconnectionstatechange = () => {
+      console.log("Connection state changed:", peerConnection.connectionState);
+
+      // Report connection state to the server
+      if (socket && selectedUser) {
+        socket.emit("connection-status", {
+          status: peerConnection.connectionState,
+          target: selectedUser.socketId,
+        });
+      }
+
+      // Handle connection failures
+      if (peerConnection.connectionState === "failed") {
+        setTransferStatus("Connection failed. Try reconnecting.");
+      } else if (peerConnection.connectionState === "connected") {
+        setTransferStatus("Peer connection established successfully!");
+      } else if (peerConnection.connectionState === "disconnected") {
+        setTransferStatus("Connection lost. Try reconnecting.");
+      }
+    };
+
+    // Log ICE connection state changes
+    peerConnection.oniceconnectionstatechange = () => {
+      console.log("ICE connection state:", peerConnection.iceConnectionState);
+
+      if (peerConnection.iceConnectionState === "failed") {
+        // Attempt ICE restart if it fails
+        if (reconnectionAttemptsRef.current < maxReconnectionAttempts) {
+          reconnectionAttemptsRef.current++;
+          setTransferStatus(
+            `ICE connection failed. Attempting restart (${reconnectionAttemptsRef.current}/${maxReconnectionAttempts})...`
+          );
+
+          // Try to restart ICE
+          peerConnection.restartIce();
+        } else {
+          setTransferStatus(
+            "Connection failed after multiple attempts. Please try again."
+          );
+        }
       }
     };
 
@@ -133,13 +276,14 @@ function FileSharing() {
     return peerConnection;
   };
 
-  // Set up data channel for sending/receiving files
+  // Set up data channel for sending/receiving files with enhanced reliability
   const setupDataChannel = (dataChannel) => {
     dataChannelRef.current = dataChannel;
 
     dataChannel.onopen = () => {
       console.log("Data channel opened");
       setTransferStatus("Connected! Ready to transfer files");
+      reconnectionAttemptsRef.current = 0;
     };
 
     dataChannel.onclose = () => {
@@ -155,69 +299,133 @@ function FileSharing() {
     dataChannel.onmessage = (event) => {
       const data = event.data;
 
-      // Handle different message types
-      if (typeof data === "string") {
-        const message = JSON.parse(data);
+      try {
+        // Handle different message types
+        if (typeof data === "string") {
+          const message = JSON.parse(data);
 
-        if (message.type === "file-info") {
-          // Reset and prepare for new file
-          fileInfoRef.current = message.info;
-          receivedBuffersRef.current = [];
-          receivedSizeRef.current = 0;
-          setTransferStatus(`Receiving: ${message.info.name}`);
-          setTransferProgress(0);
-        } else if (message.type === "transfer-complete") {
-          // Process the completed file
-          processReceivedFile();
+          if (message.type === "file-info") {
+            // Reset and prepare for new file
+            fileInfoRef.current = message.info;
+            receivedBuffersRef.current = [];
+            receivedSizeRef.current = 0;
+            setTransferStatus(`Receiving: ${message.info.name}`);
+            setTransferProgress(0);
+          } else if (message.type === "transfer-complete") {
+            // Process the completed file
+            processReceivedFile();
+          } else if (message.type === "ping") {
+            // Respond to ping with pong to check connection
+            dataChannel.send(
+              JSON.stringify({ type: "pong", timestamp: Date.now() })
+            );
+          } else if (message.type === "pong") {
+            console.log("Received pong, connection verified");
+          }
+        } else {
+          // Handle file chunk
+          receivedBuffersRef.current.push(data);
+          receivedSizeRef.current += data.byteLength;
+
+          // Update progress
+          if (fileInfoRef.current && fileInfoRef.current.size > 0) {
+            const progress = Math.floor(
+              (receivedSizeRef.current / fileInfoRef.current.size) * 100
+            );
+            setTransferProgress(progress);
+          }
         }
-      } else {
-        // Handle file chunk
-        receivedBuffersRef.current.push(data);
-        receivedSizeRef.current += data.byteLength;
-
-        // Update progress
-        const progress = Math.floor(
-          (receivedSizeRef.current / fileInfoRef.current.size) * 100
-        );
-        setTransferProgress(progress);
+      } catch (error) {
+        console.error("Error processing message:", error);
+        setTransferStatus(`Error processing data: ${error.message}`);
       }
     };
   };
 
   // Process the received file once transfer is complete
   const processReceivedFile = () => {
-    const fileInfo = fileInfoRef.current;
-    const blob = new Blob(receivedBuffersRef.current, { type: fileInfo.type });
-    const url = URL.createObjectURL(blob);
+    try {
+      const fileInfo = fileInfoRef.current;
+      if (!fileInfo || receivedBuffersRef.current.length === 0) {
+        setTransferStatus("Error: Invalid file data received");
+        return;
+      }
 
-    setReceivedFiles((prev) => [
-      ...prev,
-      {
-        name: fileInfo.name,
-        type: fileInfo.type,
-        size: fileInfo.size,
-        url,
-        sender: fileInfo.sender || "Unknown user", // Store sender name
-      },
-    ]);
+      const blob = new Blob(receivedBuffersRef.current, {
+        type: fileInfo.type || "application/octet-stream",
+      });
+      const url = URL.createObjectURL(blob);
 
-    setTransferStatus("File received successfully!");
-    setTransferProgress(100);
+      setReceivedFiles((prev) => [
+        ...prev,
+        {
+          name: fileInfo.name,
+          type: fileInfo.type || "application/octet-stream",
+          size: fileInfo.size,
+          url,
+          sender: fileInfo.sender || "Unknown user",
+          timestamp: new Date().toISOString(),
+        },
+      ]);
+
+      setTransferStatus("File received successfully!");
+      setTransferProgress(100);
+    } catch (error) {
+      console.error("Error processing received file:", error);
+      setTransferStatus(`Error processing file: ${error.message}`);
+    }
   };
 
-  // Initiate connection to selected user
-  const connectToPeer = async () => {
-    if (!selectedUser) return;
+  // Check if connection is active and working
+  const checkConnection = () => {
+    if (
+      dataChannelRef.current &&
+      dataChannelRef.current.readyState === "open"
+    ) {
+      try {
+        // Send a ping message to verify the connection
+        dataChannelRef.current.send(
+          JSON.stringify({
+            type: "ping",
+            timestamp: Date.now(),
+          })
+        );
 
+        return true;
+      } catch (error) {
+        console.error("Error checking connection:", error);
+        return false;
+      }
+    }
+    return false;
+  };
+
+  // Initiate connection to selected user with better error handling
+  const connectToPeer = async () => {
+    if (!selectedUser || !socket) {
+      setTransferStatus("No user selected or socket not connected");
+      return;
+    }
+
+    setTransferStatus("Initializing connection...");
     const peerConnection = initializePeerConnection();
 
-    // Create data channel
-    const dataChannel = peerConnection.createDataChannel("fileTransfer");
-    setupDataChannel(dataChannel);
-
-    // Create and send offer
     try {
-      const offer = await peerConnection.createOffer();
+      // Create data channel with reliable settings
+      const dataChannel = peerConnection.createDataChannel("fileTransfer", {
+        ordered: true,
+      });
+
+      setupDataChannel(dataChannel);
+
+      // Create and send offer
+      setTransferStatus("Creating connection offer...");
+      const offer = await peerConnection.createOffer({
+        offerToReceiveAudio: false,
+        offerToReceiveVideo: false,
+        voiceActivityDetection: false,
+      });
+
       await peerConnection.setLocalDescription(offer);
 
       socket.emit("offer", {
@@ -225,18 +433,19 @@ function FileSharing() {
         offer,
       });
 
-      setTransferStatus("Connecting...");
+      setTransferStatus("Connection offer sent. Waiting for answer...");
     } catch (error) {
       console.error("Error creating offer:", error);
-      setTransferStatus(`Error: ${error.message}`);
+      setTransferStatus(`Connection error: ${error.message}`);
     }
   };
 
-  // Handle receiving an offer from another peer
+  // Handle receiving an offer from another peer with enhanced error handling
   const handleReceiveOffer = async (data) => {
-    const peerConnection = initializePeerConnection();
-
     try {
+      setTransferStatus("Received connection request...");
+      const peerConnection = initializePeerConnection();
+
       await peerConnection.setRemoteDescription(
         new RTCSessionDescription(data.offer)
       );
@@ -255,34 +464,65 @@ function FileSharing() {
         setSelectedUser(user);
       }
 
-      setTransferStatus("Incoming connection...");
+      setTransferStatus("Connection answer sent. Establishing connection...");
     } catch (error) {
       console.error("Error handling offer:", error);
-      setTransferStatus(`Error: ${error.message}`);
+      setTransferStatus(`Connection error: ${error.message}`);
+
+      // Inform the other peer about the failure
+      if (socket && data.from) {
+        socket.emit("connection-status", {
+          status: "failed",
+          target: data.from,
+          error: error.message,
+        });
+      }
     }
   };
 
-  // Handle receiving an answer after sending an offer
+  // Handle receiving an answer after sending an offer with better error handling
   const handleReceiveAnswer = async (data) => {
     try {
+      setTransferStatus("Received connection answer...");
+
       // If broadcasting, use the specific peer connection for this user
       if (peerConnectionsRef.current[data.from]) {
         await peerConnectionsRef.current[data.from].setRemoteDescription(
           new RTCSessionDescription(data.answer)
         );
+        console.log(`Answer set for broadcast connection to ${data.from}`);
       }
       // Otherwise use the single peer connection
       else if (peerConnectionRef.current) {
         await peerConnectionRef.current.setRemoteDescription(
           new RTCSessionDescription(data.answer)
         );
+        console.log("Answer set for connection");
+      } else {
+        console.error("No peer connection found to handle answer");
+        setTransferStatus("Connection error: No active connection");
+        return;
       }
+
+      setTransferStatus(
+        "Connection established! Waiting for secure channel..."
+      );
     } catch (error) {
       console.error("Error handling answer:", error);
+      setTransferStatus(`Connection error: ${error.message}`);
+
+      // Inform the other peer about the failure
+      if (socket && data.from) {
+        socket.emit("connection-status", {
+          status: "failed",
+          target: data.from,
+          error: error.message,
+        });
+      }
     }
   };
 
-  // Handle ICE candidates
+  // Handle ICE candidates with improved error handling
   const handleReceiveICECandidate = async (data) => {
     try {
       // If broadcasting, use the specific peer connection for this user
@@ -296,6 +536,8 @@ function FileSharing() {
         await peerConnectionRef.current.addIceCandidate(
           new RTCIceCandidate(data.candidate)
         );
+      } else {
+        console.error("No peer connection to add ICE candidate to");
       }
     } catch (error) {
       console.error("Error adding ICE candidate:", error);
@@ -307,10 +549,15 @@ function FileSharing() {
     setFiles(Array.from(e.target.files));
   };
 
-  // Broadcast files to all connected users
+  // Create a delay function for broadcast pacing
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  // Broadcast files to all connected users with enhanced reliability
   const broadcastFiles = async () => {
-    if (!files.length || users.length === 0) {
-      setTransferStatus("No files selected or no users available");
+    if (!files.length || users.length === 0 || !socket) {
+      setTransferStatus(
+        "No files selected, no users available, or not connected"
+      );
       return;
     }
 
@@ -319,30 +566,12 @@ function FileSharing() {
 
     // Initialize connections to all users
     let connectedUsers = 0;
+    let failedUsers = 0;
     const totalUsers = users.length;
-
-    // Create a promise-based delay function
-    const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
     // Track answers received from users
     const answersReceived = {};
-
-    // Create a handler for answers specific to broadcasting
-    const handleBroadcastAnswer = (data, userId) => {
-      if (peerConnectionsRef.current[userId]) {
-        peerConnectionsRef.current[userId].setRemoteDescription(
-          new RTCSessionDescription(data.answer)
-        );
-        answersReceived[userId] = true;
-      }
-    };
-
-    // Add a one-time broadcast answer handler to the socket
-    const broadcastAnswerHandler = (data) => {
-      handleBroadcastAnswer(data, data.from);
-    };
-
-    socket.on("answer", broadcastAnswerHandler);
+    const connectionStates = {};
 
     try {
       // Connect to each user and send files
@@ -360,7 +589,7 @@ function FileSharing() {
 
           // Handle ICE candidates
           peerConnection.onicecandidate = (event) => {
-            if (event.candidate) {
+            if (event.candidate && socket) {
               socket.emit("ice-candidate", {
                 target: user.socketId,
                 candidate: event.candidate,
@@ -368,10 +597,26 @@ function FileSharing() {
             }
           };
 
+          // Monitor connection state
+          peerConnection.onconnectionstatechange = () => {
+            console.log(
+              `Connection to ${user.username} state: ${peerConnection.connectionState}`
+            );
+            connectionStates[user.socketId] = peerConnection.connectionState;
+
+            if (
+              peerConnection.connectionState === "failed" ||
+              peerConnection.connectionState === "disconnected"
+            ) {
+              console.log(
+                `Connection to ${user.username} failed or disconnected`
+              );
+            }
+          };
+
           // Create data channel with reliable settings
           const dataChannel = peerConnection.createDataChannel("fileTransfer", {
             ordered: true,
-            reliable: true,
           });
 
           // Set up data channel handlers
@@ -389,7 +634,10 @@ function FileSharing() {
           };
 
           // Create and send offer
-          const offer = await peerConnection.createOffer();
+          const offer = await peerConnection.createOffer({
+            offerToReceiveAudio: false,
+            offerToReceiveVideo: false,
+          });
           await peerConnection.setLocalDescription(offer);
 
           socket.emit("offer", {
@@ -397,63 +645,55 @@ function FileSharing() {
             offer,
           });
 
+          // Register a one-time handler for this specific user's answer
+          const answerHandler = (data) => {
+            if (data.from === user.socketId) {
+              answersReceived[user.socketId] = true;
+
+              // Set the remote description when we get an answer
+              peerConnectionsRef.current[user.socketId]
+                ?.setRemoteDescription(new RTCSessionDescription(data.answer))
+                .catch((err) => {
+                  console.error(
+                    `Error setting remote description for ${user.username}:`,
+                    err
+                  );
+                });
+            }
+          };
+
+          socket.on("answer", answerHandler);
+
           // Wait for answer with timeout
-          await new Promise((resolve, reject) => {
-            const checkAnswer = async () => {
-              // Check if we received an answer
-              if (answersReceived[user.socketId]) {
-                resolve();
-                return;
-              }
+          let answerReceived = false;
+          for (let attempt = 0; attempt < 10; attempt++) {
+            await delay(500);
+            if (answersReceived[user.socketId]) {
+              answerReceived = true;
+              break;
+            }
+          }
 
-              // Try a few times with delay
-              for (let attempt = 0; attempt < 10; attempt++) {
-                await delay(500);
-                if (answersReceived[user.socketId]) {
-                  resolve();
-                  return;
-                }
-              }
+          // Remove the one-time handler
+          socket.off("answer", answerHandler);
 
-              // Give up after 5 seconds
-              reject(new Error("Connection timeout waiting for answer"));
-            };
-
-            checkAnswer();
-          });
+          if (!answerReceived) {
+            throw new Error("No answer received within timeout");
+          }
 
           // Wait for data channel to open with timeout
-          await new Promise((resolve, reject) => {
-            const timeout = setTimeout(
-              () => reject(new Error("Data channel didn't open")),
-              5000
-            );
+          let channelOpened = false;
+          for (let attempt = 0; attempt < 20; attempt++) {
+            await delay(500);
+            if (dataChannelsRef.current[user.socketId]?.readyState === "open") {
+              channelOpened = true;
+              break;
+            }
+          }
 
-            const checkChannel = async () => {
-              // Check if channel is already open
-              if (
-                dataChannelsRef.current[user.socketId]?.readyState === "open"
-              ) {
-                clearTimeout(timeout);
-                resolve();
-                return;
-              }
-
-              // Try a few times with delay
-              for (let attempt = 0; attempt < 10; attempt++) {
-                await delay(500);
-                if (
-                  dataChannelsRef.current[user.socketId]?.readyState === "open"
-                ) {
-                  clearTimeout(timeout);
-                  resolve();
-                  return;
-                }
-              }
-            };
-
-            checkChannel();
-          });
+          if (!channelOpened) {
+            throw new Error("Data channel didn't open within timeout");
+          }
 
           // Send files to this user
           for (const file of files) {
@@ -462,7 +702,7 @@ function FileSharing() {
             // Create a file info object with sender name
             const fileInfo = {
               name: file.name,
-              type: file.type,
+              type: file.type || "application/octet-stream",
               size: file.size,
               sender: username,
             };
@@ -476,13 +716,20 @@ function FileSharing() {
             );
 
             // Short delay after sending file info
-            await delay(100);
+            await delay(200);
 
             // Send file in chunks with backpressure handling
-            const chunkSize = 16384;
+            const chunkSize = 16384; // 16KB chunks
             let offset = 0;
 
             while (offset < file.size) {
+              // Check if connection is still open
+              if (
+                dataChannelsRef.current[user.socketId]?.readyState !== "open"
+              ) {
+                throw new Error("Connection lost during file transfer");
+              }
+
               const slice = file.slice(offset, offset + chunkSize);
               const arrayBuffer = await slice.arrayBuffer();
 
@@ -495,10 +742,15 @@ function FileSharing() {
                 await new Promise((resolve) => {
                   const checkBuffer = () => {
                     if (
+                      dataChannelsRef.current[user.socketId]?.readyState !==
+                      "open"
+                    ) {
+                      resolve(); // Connection closed, stop waiting
+                    } else if (
                       dataChannelsRef.current[user.socketId].bufferedAmount <
                       512 * 1024
                     ) {
-                      resolve();
+                      resolve(); // Buffer cleared enough
                     } else {
                       setTimeout(checkBuffer, 100);
                     }
@@ -507,7 +759,16 @@ function FileSharing() {
                 });
               }
 
-              dataChannelsRef.current[user.socketId].send(arrayBuffer);
+              try {
+                dataChannelsRef.current[user.socketId].send(arrayBuffer);
+              } catch (error) {
+                console.error(
+                  `Error sending chunk to ${user.username}:`,
+                  error
+                );
+                throw new Error(`Failed to send data: ${error.message}`);
+              }
+
               offset += arrayBuffer.byteLength;
 
               // Update progress occasionally
@@ -525,7 +786,7 @@ function FileSharing() {
             );
 
             // Short delay between files
-            await delay(200);
+            await delay(300);
           }
 
           connectedUsers++;
@@ -537,13 +798,31 @@ function FileSharing() {
           setTransferStatus(
             `Failed to send to ${user.username}: ${error.message}`
           );
+          failedUsers++;
+        } finally {
+          // Clean up this specific connection after sending files
+          try {
+            if (dataChannelsRef.current[user.socketId]) {
+              dataChannelsRef.current[user.socketId].close();
+            }
+          } catch (e) {
+            console.error("Error closing data channel:", e);
+          }
         }
       }
     } finally {
-      // Clean up the temporary socket handler
-      socket.off("answer", broadcastAnswerHandler);
+      // Final status report
+      if (connectedUsers === totalUsers) {
+        setTransferStatus(
+          `Broadcast complete! Successfully sent to all ${totalUsers} users.`
+        );
+      } else {
+        setTransferStatus(
+          `Broadcast complete. Sent to ${connectedUsers}/${totalUsers} users. Failed: ${failedUsers}`
+        );
+      }
 
-      // Clean up peer connections
+      // Clean up all peer connections
       for (const userId in peerConnectionsRef.current) {
         try {
           if (peerConnectionsRef.current[userId]) {
@@ -555,16 +834,13 @@ function FileSharing() {
       }
 
       // Reset state
-      setTransferStatus(
-        `Broadcast complete! Sent to ${connectedUsers}/${totalUsers} users`
-      );
       setBroadcasting(false);
       peerConnectionsRef.current = {};
       dataChannelsRef.current = {};
     }
   };
 
-  // Send selected files
+  // Send selected files with improved error handling and chunking
   const sendFiles = async () => {
     if (
       !files.length ||
@@ -575,41 +851,82 @@ function FileSharing() {
       return;
     }
 
+    // Check connection before starting transfer
+    if (!checkConnection()) {
+      setTransferStatus(
+        "Connection appears to be unstable. Trying to reconnect..."
+      );
+      if (selectedUser) {
+        await connectToPeer();
+      }
+      return;
+    }
+
     // Process each file sequentially
     for (let i = 0; i < files.length; i++) {
       const file = files[i];
-      await sendSingleFile(file);
+      try {
+        await sendSingleFile(file);
 
-      // Update status if we have more files to send
-      if (i < files.length - 1) {
-        setTransferStatus(
-          `Preparing next file (${i + 1}/${files.length} complete)...`
-        );
-        // Short delay to update the UI
-        await new Promise((resolve) => setTimeout(resolve, 500));
+        // Update status if we have more files to send
+        if (i < files.length - 1) {
+          setTransferStatus(
+            `Preparing next file (${i + 1}/${files.length} complete)...`
+          );
+          // Short delay to update the UI
+          await delay(500);
+        }
+      } catch (error) {
+        console.error(`Error sending file ${file.name}:`, error);
+        setTransferStatus(`Error sending ${file.name}: ${error.message}`);
+
+        // If connection was lost, try to reconnect
+        if (
+          !dataChannelRef.current ||
+          dataChannelRef.current.readyState !== "open"
+        ) {
+          setTransferStatus("Connection lost. Trying to reconnect...");
+          if (selectedUser) {
+            await connectToPeer();
+          }
+          break;
+        }
       }
     }
 
-    setTransferStatus(`All files sent successfully! (${files.length} files)`);
+    setTransferStatus(`Transfer complete! (${files.length} files)`);
   };
 
-  // Helper function to send a single file
+  // Helper function to send a single file with improved reliability
   const sendSingleFile = (file) => {
     return new Promise((resolve, reject) => {
+      if (
+        !dataChannelRef.current ||
+        dataChannelRef.current.readyState !== "open"
+      ) {
+        reject(new Error("No open data channel"));
+        return;
+      }
+
       // Send file metadata first
       const fileInfo = {
         name: file.name,
-        type: file.type,
+        type: file.type || "application/octet-stream",
         size: file.size,
         sender: username, // Include sender name
       };
 
-      dataChannelRef.current.send(
-        JSON.stringify({
-          type: "file-info",
-          info: fileInfo,
-        })
-      );
+      try {
+        dataChannelRef.current.send(
+          JSON.stringify({
+            type: "file-info",
+            info: fileInfo,
+          })
+        );
+      } catch (error) {
+        reject(new Error(`Failed to send file info: ${error.message}`));
+        return;
+      }
 
       // Read and send the file in chunks
       const chunkSize = 16384; // 16KB chunks
@@ -619,7 +936,15 @@ function FileSharing() {
       fileReaderRef.current = fileReader;
 
       fileReader.onload = (e) => {
-        if (dataChannelRef.current.readyState === "open") {
+        if (
+          !dataChannelRef.current ||
+          dataChannelRef.current.readyState !== "open"
+        ) {
+          reject(new Error("Connection lost during file transfer"));
+          return;
+        }
+
+        try {
           dataChannelRef.current.send(e.target.result);
           offset += e.target.result.byteLength;
 
@@ -630,7 +955,13 @@ function FileSharing() {
 
           // Continue reading if there's more data
           if (offset < file.size) {
-            readSlice(offset);
+            // Handle backpressure
+            if (dataChannelRef.current.bufferedAmount > 1024 * 1024) {
+              // If buffer is getting full, wait before sending more
+              setTimeout(() => readSlice(offset), 100);
+            } else {
+              readSlice(offset);
+            }
           } else {
             // Signal transfer completion
             dataChannelRef.current.send(
@@ -642,6 +973,8 @@ function FileSharing() {
             // Resolve the promise when the file is done
             resolve();
           }
+        } catch (error) {
+          reject(new Error(`Error sending chunk: ${error.message}`));
         }
       };
 
@@ -698,6 +1031,7 @@ function FileSharing() {
             dataChannelRef={dataChannelRef}
             receivedFiles={receivedFiles}
             downloadFile={downloadFile}
+            connectionState={connectionState}
           />
         )}
       </div>
@@ -723,6 +1057,7 @@ function MainInterface({
   dataChannelRef,
   receivedFiles,
   downloadFile,
+  connectionState,
 }) {
   return (
     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
@@ -733,6 +1068,7 @@ function MainInterface({
         setSelectedUser={setSelectedUser}
         connectToPeer={connectToPeer}
         currentUser={username}
+        connectionState={connectionState}
       />
       {/* File Transfer Card */}
       <FileUpload
@@ -745,12 +1081,9 @@ function MainInterface({
         selectedUser={selectedUser}
         dataChannelRef={dataChannelRef}
         users={users}
-        receivedFiles={receivedFiles}
-        downloadFile={downloadFile}
       />
+      {/* Received Files Card */}
       <FileReceive receivedFiles={receivedFiles} downloadFile={downloadFile} />
     </div>
   );
 }
-
-// File Transfer Component
